@@ -6,72 +6,47 @@ Automated, unmodified builds of the open-source [Fritzing](https://github.com/fr
 
 ---
 
-## How It Works
-
-1. **Monthly Upstream Check (`0 3 1 * *`)**:
-   - On the 1st of every month at 03:00 UTC, the `check-upstream` job queries the latest release tag/commit from `fritzing/fritzing-app`.
-   - It checks whether a release for that exact version (`fritzing-<tag>-<short_sha>`) already exists in this repository's **GitHub Releases**.
-   - If the version is already published, the workflow **skips all build jobs in ~15 seconds** to save runner minutes.
-2. **Automated 3-OS Compilation**:
-   - Whenever a new upstream version is detected (or when triggered manually with `force_build: true`), GitHub Actions compiles Fritzing across **Linux**, **Windows**, and **macOS** in parallel.
-3. **Pre-Built SQLite Parts Database (`parts.db`)**:
-   - Runs `Fritzing -db "../fritzing-parts/parts.db"` during packaging so the complete component library works immediately out of the box.
-
+## Key Features & Anti-Lag Optimizations
+ 
+1. **Dynamic Upstream Dependency Detection (`pri/*detect.pri`)**:
+   - Automatically parses `fritzing-app/src/version/version.cpp` and `fritzing-app/pri/*detect.pri` (`libgit2`, `QuaZip`, `Clipper1`, `Boost`, `SVG++`, `ngspice`) so sibling directory names and versions always match what `phoenix.pro` expects.
+2. **Monthly Auto-Check & Deduplication (`0 3 1 * *`)**:
+   - Checks `fritzing/fritzing-app@develop` on the 1st of every month at `03:00 UTC`.
+   - If the current `<version>-<commit>` is already published in **GitHub Releases**, the workflow **skips all 3 OS compilation jobs in ~15 seconds**.
+3. **Aggressive Compiler & Runtime Optimizations (Zero Canvas Lag)**:
+   - **Link-Time Optimization (`LTO` / `/LTCG`)**: Enables cross-module inlining across `phoenix.pro`, `svgpp` template geometry parsers, and `Clipper1` copper fill routines.
+   - **Native SIMD Vectorization**: Built with `/O2 /Ob3 /Oi /Ot /GL /fp:fast /arch:AVX2` on Windows (MSVC), `-O3 -flto=auto -ffast-math -march=x86-64-v3 -fomit-frame-pointer` on Linux (GCC), and `-O3 -flto=thin -ffast-math -fomit-frame-pointer` on macOS (Clang).
+   - **Zero Debug Logging Overhead**: Defines `QT_NO_DEBUG`, `QT_NO_DEBUG_OUTPUT`, `QT_NO_INFO_OUTPUT`, `QT_NO_WARNING_OUTPUT`, and `NDEBUG` to eliminate runtime string formatting during breadboard/PCB dragging and zooming.
+   - **Indexed & Defragmented `parts.db` + Packed `.git`**: Pre-builds `parts.db` at package time, runs SQLite `ANALYZE; VACUUM;` with 4 KB page alignment for instant component search, and compacts `fritzing-parts/.git` via `git gc --prune=now` for fast startup.
+ 
 ---
-
-## Download Latest Builds
-
-Visit the [**Releases**](../../releases/latest) page to download the latest packaged binaries for your operating system:
-
-| Operating System | Architecture | Package Format | Description |
+ 
+## Download Pre-Built Packages
+ 
+Go to the [**Releases**](../../releases/latest) page to download the latest build for your operating system:
+ 
+| Operating System | Architecture | Package Format | Bundled Runtime & Parts |
 | :--- | :--- | :--- | :--- |
-| **Linux** (Ubuntu 22.04+) | `x86_64` | `.AppImage` | Standalone executable (`chmod +x Fritzing-*.AppImage`) |
-| **Windows** (10 / 11) | `x64` (MSVC) | `.zip` | Portable archive with all Qt6, libgit2, and ngspice DLLs |
-| **macOS** (14+) | `arm64` (Apple Silicon) | `.dmg` | Ad-hoc signed application bundle (`Fritzing.app`) |
-
-> **macOS Gatekeeper Note:** Because these community builds are ad-hoc signed without an Apple Developer ID certificate, run the following command if macOS shows an unverified developer prompt:
-> ```bash
-> xattr -cr /Applications/Fritzing.app
-> ```
-
+| **Linux** (Ubuntu 24.04+) | `x86_64` | `.tar.gz` (Self-Contained Portable) | Qt `6.8.3`, `libgit2`, `ngspice`, `QuaZip`, `Clipper1`, `parts.db` |
+| **Windows** (10 / 11) | `x64` (MSVC 2022) | `.zip` (Self-Contained Portable) | Qt `6.8.3`, VC++ CRT, `ngspice.dll`, `quazip1-qt6.dll`, `parts.db` |
+| **macOS** (14 / 15+) | `arm64` (Apple Silicon) | `.dmg` (Signed App Bundle) | Qt `6.8.2`, `libngspice.dylib`, `libquazip1-qt6.dylib`, `parts.db` |
+ 
 ---
-
-## C++ Dependency Stack
-
-Fritzing's `phoenix.pro` build configuration expects exact sibling directories (`../`). The workflow automatically compiles and caches:
-
-- **Qt SDK**: `6.5.3` (`qtbase`, `qtsvg`, `qtserialport`, `qt5compat`, `qtsql`)
-- **libgit2**: `1.7.1` (`../libgit2/build64`)
-- **ngspice**: `v42` shared simulation library (`../ngspice-42`)
-- **Boost**: `1.83.0` header library (`../boost_1_83_0`)
-- **QuaZip**: `1.4` built against Qt6 (`../quazip_qt6`)
-- **PolyClipper**: `6.4.2` (`../clipper1`)
-- **SVG++**: `1.3.1` (`../svgpp`)
-
----
-
-## Repository Setup (If Forking or Creating From Scratch)
-
-1. Place `.github/workflows/build-fritzing.yml` in your repository.
-2. Go to **Settings → Actions → General → Workflow permissions** and select **Read and write permissions**, then click **Save**.
-3. Open the **Actions** tab, select **Auto Check & Build Fritzing Multi-OS (Monthly)**, and click **Run workflow** for your initial build.
-
----
-
-## Verifying Checksums
-
-Every release includes a `SHA256SUMS.txt` file generated during CI. Verify your downloaded package with:
-
-```bash
-# Linux / macOS
-sha256sum -c SHA256SUMS.txt --ignore-missing
-
-# Windows PowerShell
-Get-FileHash .\Fritzing-*-windows-x64.zip -Algorithm SHA256
+ 
+## Repository Structure (Only 2 Files Needed)
+ 
+```text
+.
+├── .github/
+│   └── workflows/
+│       └── build-fritzing.yml   # Automated monthly check + 3-OS LTO/AVX2 build & release pipeline
+└── README.md                    # Repository documentation
 ```
-
+ 
 ---
-
-## License
-
-Fritzing source code is licensed under **GPL-3.0** by the [Fritzing organization](https://github.com/fritzing/fritzing-app).
+ 
+## Setup Instructions
+ 
+1. Copy `.github/workflows/build-fritzing.yml` and `README.md` into your GitHub repository.
+2. Go to **Settings → Actions → General → Workflow permissions**, select **Read and write permissions**, and click **Save**.
+3. Open the **Actions** tab, select **Auto Check & Build Fritzing Multi-OS (Monthly)**, click **Run workflow**, and click the green **Run workflow** button.
