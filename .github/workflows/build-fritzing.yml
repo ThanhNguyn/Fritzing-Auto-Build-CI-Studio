@@ -202,7 +202,7 @@ jobs:
           version: ${{ env.QT_VERSION }}
           host: "linux"
           target: "desktop"
-          arch: "gcc_64"
+          arch: "linux_gcc_64"
           modules: "qtserialport qt5compat"
           cache: true
 
