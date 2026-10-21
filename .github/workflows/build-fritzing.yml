@@ -1,0 +1,556 @@
+# ==============================================================================
+# File: .github/workflows/build-fritzing.yml
+# Description: Monthly automated GitHub Actions workflow that checks
+#              fritzing/fritzing-app for new releases/commits. If a newer
+#              version is found (not yet in this repo's GitHub Releases),
+#              it automatically compiles and publishes installers for
+#              Linux (AppImage), Windows (MSVC x64 ZIP), and macOS (DMG).
+# ==============================================================================
+
+name: "Auto Check & Build Fritzing Multi-OS (Monthly)"
+
+on:
+  schedule:
+    # Runs automatically once a month on the 1st at 03:00 UTC
+    - cron: "0 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      fritzing_ref:
+        description: "Upstream tag, branch, or commit ('latest' auto-detects latest tag/branch)"
+        required: false
+        default: "latest"
+      force_build:
+        description: "Force rebuild even if this version is already published in Releases"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fritzing-autobuild-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-upstream:
+    name: "1. Check Upstream Fritzing & Compare Latest Release"
+    runs-on: ubuntu-latest
+    outputs:
+      fritzing_ref: ${{ steps.check.outputs.fritzing_ref }}
+      version_tag: ${{ steps.check.outputs.version_tag }}
+      short_sha: ${{ steps.check.outputs.short_sha }}
+      build_date: ${{ steps.check.outputs.build_date }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check latest upstream version and compare with existing Releases
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ github.event.inputs.fritzing_ref || 'latest' }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+        run: |
+          set -euo pipefail
+          BUILD_DATE=$(date -u +"%Y.%m.%d")
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+
+          if [ "${INPUT_REF}" = "latest" ]; then
+            echo "Checking latest release tag on fritzing/fritzing-app..."
+            LATEST_TAG=$(git ls-remote --tags --sort="-v:refname" "https://github.com/fritzing/fritzing-app.git" \
+              | grep -v '\^{}' | head -n 1 | awk -F'refs/tags/' '{print $2}' || true)
+            if [ -n "${LATEST_TAG}" ]; then
+              TARGET_REF="${LATEST_TAG}"
+            else
+              TARGET_REF="develop"
+            fi
+          else
+            TARGET_REF="${INPUT_REF}"
+          fi
+
+          COMMIT_SHA=$(git ls-remote "https://github.com/fritzing/fritzing-app.git" "${TARGET_REF}" | head -n 1 | awk '{print $1}')
+          if [ -z "${COMMIT_SHA}" ]; then
+            COMMIT_SHA=$(git ls-remote "https://github.com/fritzing/fritzing-app.git" HEAD | head -n 1 | awk '{print $1}')
+          fi
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          VERSION_TAG="${TARGET_REF}-${SHORT_SHA}"
+          RELEASE_TAG="fritzing-${VERSION_TAG}"
+
+          echo "fritzing_ref=${TARGET_REF}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          # Check if this exact upstream version has already been built and released in this repository
+          if [ "${FORCE_BUILD}" = "true" ]; then
+            echo "Force build requested. Proceeding with 3-OS compilation."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} already exists in ${GITHUB_REPOSITORY}. Skipping build to save runner minutes."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New Fritzing version detected (${RELEASE_TAG}). Triggering multi-OS build!"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux:
+    name: "Build Linux (Ubuntu 22.04 x86_64 AppImage)"
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install system build tools and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git curl wget unzip \
+            libgl1-mesa-dev libglu1-mesa-dev libssl-dev zlib1g-dev libxcb-xinerama0 \
+            libxcb-cursor0 libxkbcommon-x11-0 libfuse2 xvfb patchelf desktop-file-utils
+
+      - name: Install Qt 6.5.3 (gcc_64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          arch: 'gcc_64'
+          modules: 'qtserialport qt5compat'
+          cache: true
+
+      - name: Checkout fritzing-app (${{ needs.check-upstream.outputs.fritzing_ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-app'
+          ref: ${{ needs.check-upstream.outputs.fritzing_ref }}
+          path: fritzing-app
+
+      - name: Checkout fritzing-parts (master)
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-parts'
+          ref: 'master'
+          path: fritzing-parts
+
+      - name: Cache compiled C++ dependencies (Linux)
+        id: cache-deps-linux
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/boost_1_83_0
+            ${{ github.workspace }}/libgit2
+            ${{ github.workspace }}/ngspice-42
+            ${{ github.workspace }}/quazip_qt6
+            ${{ github.workspace }}/svgpp
+            ${{ github.workspace }}/clipper1
+          key: fritzing-linux-deps-qt6.5.3-git1.7.1-spice42-boost1.83.0
+
+      - name: Build C++ dependencies (Boost, libgit2, ngspice, QuaZip, Clipper, SVG++)
+        if: steps.cache-deps-linux.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # 1. Boost 1.83.0 (Headers)
+          curl -sSL "https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.bz2" | tar -xj
+
+          # 2. SVG++ 1.3.1 (Headers)
+          git clone --depth 1 --branch "v1.3.1" https://github.com/svgpp/svgpp.git svgpp
+
+          # 3. libgit2 1.7.1
+          git clone --depth 1 --branch "v1.7.1" https://github.com/libgit2/libgit2.git libgit2
+          cmake -S libgit2 -B libgit2/build64 -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TESTS=OFF \
+            -DUSE_SSH=OFF
+          cmake --build libgit2/build64 --parallel
+
+          # 4. PolyClipper 6.4.2
+          mkdir -p clipper1
+          curl -sSL "https://sourceforge.net/projects/polyclipping/files/clipper_ver6.4.2.zip/download" -o clipper.zip
+          unzip -q clipper.zip -d clipper1
+          cmake -S clipper1/cpp -B clipper1/build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/clipper1/inst"
+          cmake --build clipper1/build --parallel
+          cp -f clipper1/cpp/clipper.hpp clipper1/
+          cp -f clipper1/build/libpolyclipping.so* clipper1/
+
+          # 5. QuaZip 1.4 (Qt6)
+          git clone --depth 1 --branch "v1.4" https://github.com/stachenov/quazip.git quazip-src
+          cmake -S quazip-src -B quazip-src/build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DQUAZIP_QT_MAJOR_VERSION=6 \
+            -DCMAKE_PREFIX_PATH="${Qt6_DIR}" \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/quazip_qt6"
+          cmake --build quazip-src/build --parallel
+          cmake --install quazip-src/build
+
+          # 6. ngspice-42 (Shared library)
+          curl -sSL "https://sourceforge.net/projects/ngspice/files/ng-spice-rework/42/ngspice-42.tar.gz/download" | tar -xz
+          cd "ngspice-42"
+          mkdir -p release && cd release
+          ../configure --with-ngshared --disable-debug --prefix="${GITHUB_WORKSPACE}/ngspice-42/release"
+          make -j$(nproc)
+          make install
+
+      - name: Compile Fritzing from phoenix.pro using qmake6
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p build-linux
+          cd build-linux
+          "${Qt6_DIR}/bin/qmake" ../fritzing-app/phoenix.pro \
+            CONFIG+=release \
+            DEFINES+="FRITZING_PARTS_PATH=\\\"../share/fritzing/fritzing-parts\\\""
+          make -j$(nproc)
+
+      - name: Generate SQLite parts database (parts.db)
+        working-directory: ${{ github.workspace }}/build-linux
+        run: |
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/libgit2/build64:${GITHUB_WORKSPACE}/quazip_qt6/lib:${GITHUB_WORKSPACE}/ngspice-42/release/lib:${GITHUB_WORKSPACE}/clipper1/build:${Qt6_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          xvfb-run --auto-servernum ./Fritzing -db "${GITHUB_WORKSPACE}/fritzing-parts/parts.db"
+
+      - name: Package AppDir and build Linux AppImage
+        working-directory: ${{ github.workspace }}/build-linux
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          make INSTALL_ROOT="${GITHUB_WORKSPACE}/build-linux/AppDir" install
+          mkdir -p AppDir/usr/share/fritzing
+          cp -r "${GITHUB_WORKSPACE}/fritzing-parts" AppDir/usr/share/fritzing/fritzing-parts
+          rm -rf AppDir/usr/share/fritzing/fritzing-parts/.git
+          mkdir -p AppDir/usr/lib
+          cp -P "${GITHUB_WORKSPACE}"/libgit2/build64/libgit2.so* AppDir/usr/lib/
+          cp -P "${GITHUB_WORKSPACE}"/quazip_qt6/lib/libquazip1-qt6.so* AppDir/usr/lib/
+          cp -P "${GITHUB_WORKSPACE}"/ngspice-42/release/lib/libngspice.so* AppDir/usr/lib/
+          cp -P "${GITHUB_WORKSPACE}"/clipper1/libpolyclipping.so* AppDir/usr/lib/
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          export QMAKE="${Qt6_DIR}/bin/qmake"
+          export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/libgit2/build64:${GITHUB_WORKSPACE}/quazip_qt6/lib:${GITHUB_WORKSPACE}/ngspice-42/release/lib:${GITHUB_WORKSPACE}/clipper1/build:${Qt6_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt --output appimage
+          mv Fritzing*.AppImage "${GITHUB_WORKSPACE}/artifacts/Fritzing-${{ needs.check-upstream.outputs.version_tag }}-linux-x86_64.AppImage"
+
+      - name: Upload Artifact (Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fritzing-Linux-x86_64
+          path: ${{ github.workspace }}/artifacts/*
+
+  build-windows:
+    name: "Build Windows (MSVC 2022 x64)"
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: windows-2022
+    steps:
+      - name: Initialize MSVC x64 Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt 6.5.3 (win64_msvc2019_64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          arch: 'win64_msvc2019_64'
+          modules: 'qtserialport qt5compat'
+          cache: true
+
+      - name: Checkout fritzing-app (${{ needs.check-upstream.outputs.fritzing_ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-app'
+          ref: ${{ needs.check-upstream.outputs.fritzing_ref }}
+          path: fritzing-app
+
+      - name: Checkout fritzing-parts (master)
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-parts'
+          ref: 'master'
+          path: fritzing-parts
+
+      - name: Cache compiled C++ dependencies (Windows MSVC x64)
+        id: cache-deps-win
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/boost_1_83_0
+            ${{ github.workspace }}/libgit2
+            ${{ github.workspace }}/ngspice-42
+            ${{ github.workspace }}/quazip_qt6
+            ${{ github.workspace }}/svgpp
+            ${{ github.workspace }}/clipper1
+            ${{ github.workspace }}/zlib-inst
+          key: fritzing-win64-deps-qt6.5.3-git1.7.1-spice42-boost1.83.0
+
+      - name: Build C++ dependencies on Windows (MSVC)
+        if: steps.cache-deps-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 1. Boost 1.83.0
+          curl.exe -sSL "https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.bz2" -o boost.tar.bz2
+          tar.exe -xjf boost.tar.bz2
+
+          # 2. SVG++ 1.3.1
+          git clone --depth 1 --branch "v1.3.1" https://github.com/svgpp/svgpp.git svgpp
+
+          # 3. Zlib (for QuaZip & libgit2)
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git zlib-src
+          cmake -S zlib-src -B zlib-src/build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/zlib-inst"
+          cmake --build zlib-src/build --config Release
+          cmake --install zlib-src/build
+
+          # 4. libgit2 1.7.1
+          git clone --depth 1 --branch "v1.7.1" https://github.com/libgit2/libgit2.git libgit2
+          cmake -S libgit2 -B libgit2/build64 -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DBUILD_TESTS=OFF `
+            -DUSE_SSH=OFF
+          cmake --build libgit2/build64 --config Release
+
+          # 5. PolyClipper 6.4.2
+          New-Item -ItemType Directory -Force -Path clipper1 | Out-Null
+          curl.exe -sSL "https://sourceforge.net/projects/polyclipping/files/clipper_ver6.4.2.zip/download" -o clipper.zip
+          Expand-Archive -Path clipper.zip -DestinationPath clipper1 -Force
+          cmake -S clipper1/cpp -B clipper1/build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+          cmake --build clipper1/build --config Release
+          Copy-Item clipper1/cpp/clipper.hpp clipper1/ -Force
+          Copy-Item clipper1/build/polyclipping.* clipper1/ -Force
+
+          # 6. QuaZip 1.4 (Qt6)
+          git clone --depth 1 --branch "v1.4" https://github.com/stachenov/quazip.git quazip-src
+          cmake -S quazip-src -B quazip-src/build -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DQUAZIP_QT_MAJOR_VERSION=6 `
+            -DCMAKE_PREFIX_PATH="${{ env.Qt6_DIR }};${{ github.workspace }}/zlib-inst" `
+            -DZLIB_INCLUDE_DIR="${{ github.workspace }}/zlib-inst/include" `
+            -DZLIB_LIBRARY="${{ github.workspace }}/zlib-inst/lib/zlib.lib" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/quazip_qt6"
+          cmake --build quazip-src/build --config Release
+          cmake --install quazip-src/build
+
+          # 7. ngspice-42 DLL (x64)
+          New-Item -ItemType Directory -Force -Path "ngspice-42" | Out-Null
+          curl.exe -sSL "https://sourceforge.net/projects/ngspice/files/ng-spice-rework/42/ngspice-42_dll_64.7z/download" -o ngspice_dll.7z
+          7z x ngspice_dll.7z -o"ngspice-42" -y
+          curl.exe -sSL "https://sourceforge.net/projects/ngspice/files/ng-spice-rework/42/ngspice-42.tar.gz/download" -o ngspice_src.tar.gz
+          tar.exe -xzf ngspice_src.tar.gz
+
+      - name: Compile Fritzing.exe with qmake6 and nmake
+        shell: cmd
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir build-win
+          cd build-win
+          "%Qt6_DIR%\bin\qmake.exe" ..\fritzing-app\phoenix.pro CONFIG+=release
+          nmake release
+
+      - name: Deploy Qt DLLs (windeployqt) and stage distribution directory
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-win, artifacts | Out-Null
+          Copy-Item build-win/release/Fritzing.exe dist-win/ -Force
+          Copy-Item libgit2/build64/git2.dll dist-win/ -Force
+          Copy-Item quazip_qt6/bin/quazip1-qt6.dll dist-win/ -Force
+          Copy-Item zlib-inst/bin/zlib1.dll dist-win/ -Force
+          Copy-Item clipper1/polyclipping.dll dist-win/ -Force
+          Get-ChildItem -Path "ngspice-42" -Filter "ngspice.dll" -Recurse | Select-Object -First 1 | Copy-Item -Destination dist-win/ -Force
+          Copy-Item -Recurse fritzing-app/sketches dist-win/sketches -Force
+          Copy-Item -Recurse fritzing-app/bins dist-win/bins -Force
+          Copy-Item -Recurse fritzing-app/translations dist-win/translations -Force
+          Copy-Item -Recurse fritzing-parts dist-win/fritzing-parts -Force
+          Remove-Item -Recurse -Force dist-win/fritzing-parts/.git -ErrorAction SilentlyContinue
+          & "${{ env.Qt6_DIR }}\bin\windeployqt.exe" --release --no-translations dist-win/Fritzing.exe
+
+      - name: Generate SQLite parts database (parts.db) on Windows
+        shell: pwsh
+        run: |
+          $env:PATH = "${{ github.workspace }}\dist-win;${{ env.Qt6_DIR }}\bin;$env:PATH"
+          & "${{ github.workspace }}\dist-win\Fritzing.exe" -db "${{ github.workspace }}\dist-win\fritzing-parts\parts.db"
+
+      - name: Create Portable Windows x64 ZIP Archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "${{ github.workspace }}\dist-win\*" -DestinationPath "${{ github.workspace }}\artifacts\Fritzing-${{ needs.check-upstream.outputs.version_tag }}-windows-x64.zip" -Force
+
+      - name: Upload Artifact (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fritzing-Windows-x64
+          path: ${{ github.workspace }}/artifacts/*
+
+  build-macos:
+    name: "Build macOS (arm64 DMG)"
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: macos-14
+    steps:
+      - name: Install build tools via Homebrew
+        run: |
+          brew install cmake ninja pkg-config create-dmg
+
+      - name: Install Qt 6.5.3 (clang_64 / macOS universal)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.5.3'
+          arch: 'clang_64'
+          modules: 'qtserialport qt5compat'
+          cache: true
+
+      - name: Checkout fritzing-app (${{ needs.check-upstream.outputs.fritzing_ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-app'
+          ref: ${{ needs.check-upstream.outputs.fritzing_ref }}
+          path: fritzing-app
+
+      - name: Checkout fritzing-parts (master)
+        uses: actions/checkout@v4
+        with:
+          repository: 'fritzing/fritzing-parts'
+          ref: 'master'
+          path: fritzing-parts
+
+      - name: Cache compiled C++ dependencies (macOS arm64)
+        id: cache-deps-mac
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/boost_1_83_0
+            ${{ github.workspace }}/libgit2
+            ${{ github.workspace }}/ngspice-42
+            ${{ github.workspace }}/quazip_qt6
+            ${{ github.workspace }}/svgpp
+            ${{ github.workspace }}/clipper1
+          key: fritzing-macos-arm64-deps-qt6.5.3-git1.7.1-spice42-boost1.83.0
+
+      - name: Build C++ dependencies on macOS
+        if: steps.cache-deps-mac.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # 1. Boost 1.83.0
+          curl -sSL "https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.bz2" | tar -xj
+
+          # 2. SVG++ 1.3.1
+          git clone --depth 1 --branch "v1.3.1" https://github.com/svgpp/svgpp.git svgpp
+
+          # 3. libgit2 1.7.1
+          git clone --depth 1 --branch "v1.7.1" https://github.com/libgit2/libgit2.git libgit2
+          cmake -S libgit2 -B libgit2/build64 -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TESTS=OFF \
+            -DUSE_SSH=OFF
+          cmake --build libgit2/build64 --parallel
+
+          # 4. PolyClipper 6.4.2
+          mkdir -p clipper1
+          curl -sSL "https://sourceforge.net/projects/polyclipping/files/clipper_ver6.4.2.zip/download" -o clipper.zip
+          unzip -q clipper.zip -d clipper1
+          cmake -S clipper1/cpp -B clipper1/build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build clipper1/build --parallel
+          cp -f clipper1/cpp/clipper.hpp clipper1/
+          cp -f clipper1/build/libpolyclipping.dylib* clipper1/
+
+          # 5. QuaZip 1.4 (Qt6)
+          git clone --depth 1 --branch "v1.4" https://github.com/stachenov/quazip.git quazip-src
+          cmake -S quazip-src -B quazip-src/build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DQUAZIP_QT_MAJOR_VERSION=6 \
+            -DCMAKE_PREFIX_PATH="${Qt6_DIR}" \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/quazip_qt6"
+          cmake --build quazip-src/build --parallel
+          cmake --install quazip-src/build
+
+          # 6. ngspice-42
+          curl -sSL "https://sourceforge.net/projects/ngspice/files/ng-spice-rework/42/ngspice-42.tar.gz/download" | tar -xz
+          cd "ngspice-42"
+          mkdir -p release && cd release
+          ../configure --with-ngshared --disable-debug --prefix="${GITHUB_WORKSPACE}/ngspice-42/release"
+          make -j$(sysctl -n hw.ncpu)
+          make install
+
+      - name: Compile Fritzing.app from phoenix.pro
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p build-mac
+          cd build-mac
+          "${Qt6_DIR}/bin/qmake" ../fritzing-app/phoenix.pro \
+            CONFIG+=release \
+            QMAKE_APPLE_DEVICE_ARCHS="arm64"
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Bundle assets and frameworks into Fritzing.app
+        working-directory: ${{ github.workspace }}/build-mac
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          cp -R "${GITHUB_WORKSPACE}/fritzing-parts" Fritzing.app/Contents/MacOS/fritzing-parts
+          rm -rf Fritzing.app/Contents/MacOS/fritzing-parts/.git
+          cp -R "${GITHUB_WORKSPACE}/fritzing-app/sketches" Fritzing.app/Contents/MacOS/sketches
+          cp -R "${GITHUB_WORKSPACE}/fritzing-app/bins" Fritzing.app/Contents/MacOS/bins
+          cp -R "${GITHUB_WORKSPACE}/fritzing-app/translations" Fritzing.app/Contents/MacOS/translations
+          mkdir -p Fritzing.app/Contents/Frameworks
+          cp -P "${GITHUB_WORKSPACE}"/libgit2/build64/libgit2*.dylib Fritzing.app/Contents/Frameworks/
+          cp -P "${GITHUB_WORKSPACE}"/quazip_qt6/lib/libquazip1-qt6*.dylib Fritzing.app/Contents/Frameworks/
+          cp -P "${GITHUB_WORKSPACE}"/ngspice-42/release/lib/libngspice*.dylib Fritzing.app/Contents/Frameworks/
+          cp -P "${GITHUB_WORKSPACE}"/clipper1/libpolyclipping*.dylib Fritzing.app/Contents/Frameworks/
+
+      - name: Generate SQLite parts database (parts.db) inside Fritzing.app
+        working-directory: ${{ github.workspace }}/build-mac
+        run: |
+          ./Fritzing.app/Contents/MacOS/Fritzing -db "Fritzing.app/Contents/MacOS/fritzing-parts/parts.db"
+
+      - name: Run macdeployqt, ad-hoc codesign, and package macOS Disk Image (.dmg)
+        working-directory: ${{ github.workspace }}/build-mac
+        run: |
+          "${Qt6_DIR}/bin/macdeployqt" Fritzing.app -always-overwrite
+          codesign --force --deep --sign - Fritzing.app
+          hdiutil create -volname "Fritzing" -srcfolder Fritzing.app -ov -format UDZO \
+            "${GITHUB_WORKSPACE}/artifacts/Fritzing-${{ needs.check-upstream.outputs.version_tag }}-macos-arm64.dmg"
+
+      - name: Upload Artifact (macOS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fritzing-macOS-arm64
+          path: ${{ github.workspace }}/artifacts/*
+
+  publish-release:
+    name: "Package & Publish to GitHub Releases"
+    needs: [check-upstream, build-linux, build-windows, build-macos]
+    if: needs.check-upstream.outputs.should_build == 'true' && success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all OS build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt checksum manifest
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "fritzing-${{ needs.check-upstream.outputs.version_tag }}"
+          name: "Fritzing ${{ needs.check-upstream.outputs.fritzing_ref }} (${{ needs.check-upstream.outputs.build_date }})"
+          body: |
+            ## Automated Multi-OS Fritzing Build
+            - **Upstream Source:** `fritzing/fritzing-app@${{ needs.check-upstream.outputs.fritzing_ref }}` (`${{ needs.check-upstream.outputs.short_sha }}`)
+            - **Parts Database:** `fritzing/fritzing-parts@master` (Pre-compiled `parts.db` included)
+            - **Dependency Stack:** Qt `6.5.3`, libgit2 `1.7.1`, ngspice `v42`, Boost `1.83.0`
+            - **Checksums:** See attached `SHA256SUMS.txt`.
+          files: release-assets/*
+          draft: false
+          prerelease: false
