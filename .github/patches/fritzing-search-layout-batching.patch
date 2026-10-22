@@ -1,0 +1,88 @@
+diff --git a/src/partsbinpalette/partsbiniconview.h b/src/partsbinpalette/partsbiniconview.h
+--- a/src/partsbinpalette/partsbiniconview.h
++++ b/src/partsbinpalette/partsbiniconview.h
+@@ -35,4 +35,6 @@ public:
+ 	void setPaletteModel(PaletteModel *model, bool clear=false);
+ 	void addPart(ModelPart * model, int position = -1);
++	void beginBulkUpdate();
++	void endBulkUpdate();
+ 	void removePart(const QString &moduleID);
+ 	void removeParts();
+@@ -75,5 +77,7 @@ protected:
+ 	QMenu *m_itemMenu = nullptr;
+ 	bool m_noSelectionChangeEmition = false;
++	bool m_bulkUpdate = false;
++	bool m_updatesWereEnabled = true;
+ };
+ 
+ #endif /* ICONVIEW_H_ */
+diff --git a/src/partsbinpalette/partsbiniconview.cpp b/src/partsbinpalette/partsbiniconview.cpp
+--- a/src/partsbinpalette/partsbiniconview.cpp
++++ b/src/partsbinpalette/partsbiniconview.cpp
+@@ -126,4 +126,22 @@ void PartsBinIconView::resizeEvent(QResizeEvent * event) {
+ 	updateSize(event->size());
+ }
+ 
++void PartsBinIconView::beginBulkUpdate() {
++	if (m_bulkUpdate) return;
++	m_bulkUpdate = true;
++	m_updatesWereEnabled = updatesEnabled();
++	setUpdatesEnabled(false);
++}
++
++void PartsBinIconView::endBulkUpdate() {
++	if (!m_bulkUpdate) return;
++	m_bulkUpdate = false;
++	if (m_layout != nullptr && m_layout->count() > 0) {
++		setSelected(m_layout->count() - 1);
++	}
++	setUpdatesEnabled(m_updatesWereEnabled);
++	updateSize();
++	if (m_updatesWereEnabled) viewport()->update();
++}
++
+ void PartsBinIconView::mousePressEvent(QMouseEvent *event) {
+@@ -147,6 +162,10 @@ void PartsBinIconView::addPart(ModelPart * model, int position) {
+ void PartsBinIconView::addPart(ModelPart * model, int position) {
++	if (m_bulkUpdate) {
++		setItemAux(model, position);
++		return;
++	}
+ 	PartsBinView::addPart(model, position);
+ 	updateSize();
+ }
+ 
+ void PartsBinIconView::removePart(const QString &moduleID) {
+diff --git a/src/partsbinpalette/binmanager/binmanager.cpp b/src/partsbinpalette/binmanager/binmanager.cpp
+--- a/src/partsbinpalette/binmanager/binmanager.cpp
++++ b/src/partsbinpalette/binmanager/binmanager.cpp
+@@ -48,4 +48,5 @@
+ #include "items/partfactory.h"
+ #include "partsbinpalette/partsbinpalettewidget.h"
++#include "partsbinpalette/partsbiniconview.h"
+ #include "partsbinpalette/searchbinpalettewidget.h"
+ #include "partsbinpalette/partsbinview.h"
+@@ -165,5 +166,7 @@ void BinManager::search(const QString & searchText) {
+ 	progress.setIncValueMod(1);
+ 	searchBin->removeParts();
++	auto *iconView = dynamic_cast<PartsBinIconView *>(searchBin->currentView());
++	if (iconView != nullptr) iconView->beginBulkUpdate();
+ 	Q_FOREACH (ModelPart * modelPart, modelParts) {
+ 		//DebugDialog::debug(modelPart->title());
+ 		if (modelPart->itemType() == ModelPart::SchematicSubpart) {
+@@ -181,6 +184,7 @@ void BinManager::search(const QString & searchText) {
+ 		}
+ 		progress.incValue();
+ 	}
++	if (iconView != nullptr) iconView->endBulkUpdate();
+ 
+ 	setDirtyTab(searchBin);
+ }
+diff --git a/src/partsbinpalette/searchlineedit.cpp b/src/partsbinpalette/searchlineedit.cpp
+--- a/src/partsbinpalette/searchlineedit.cpp
++++ b/src/partsbinpalette/searchlineedit.cpp
+@@ -24,3 +24,3 @@ SearchLineEdit::SearchLineEdit(QWidget * parent) : QLineEdit(parent)
+ 	mTimer.setSingleShot(true);
+-	mTimer.setInterval(2000);
++	mTimer.setInterval(400);
+ 
