@@ -298,6 +298,7 @@ jobs:
               "src/partsbinpalette/partsbiniconview.cpp",
               "src/partsbinpalette/binmanager/binmanager.cpp",
               "src/partsbinpalette/searchlineedit.cpp",
+              "../ci-config/.github/patches/fritzing-search-layout-batching.patch",
           ):
               path = Path(name)
               data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
@@ -611,6 +612,7 @@ jobs:
               "src/partsbinpalette/partsbiniconview.cpp",
               "src/partsbinpalette/binmanager/binmanager.cpp",
               "src/partsbinpalette/searchlineedit.cpp",
+              "../ci-config/.github/patches/fritzing-search-layout-batching.patch",
           ):
               path = Path(name)
               data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
@@ -971,6 +973,7 @@ jobs:
               "src/partsbinpalette/partsbiniconview.cpp",
               "src/partsbinpalette/binmanager/binmanager.cpp",
               "src/partsbinpalette/searchlineedit.cpp",
+              "../ci-config/.github/patches/fritzing-search-layout-batching.patch",
           ):
               path = Path(name)
               data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
